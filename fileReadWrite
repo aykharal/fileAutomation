@@ -1,0 +1,16 @@
+# Appending to a text file
+with open('newfile.txt', 'a') as file:
+    file.write('Adding a new line to the existing file.\n')
+
+
+# Reading the updated file
+with open('newfile.txt', 'r') as file:
+    print(file.read())
+
+
+import csv
+# Reading a CSV file
+with open('example.csv', mode='r') as file:
+    csv_reader = csv.reader(file)
+    for row in csv_reader:
+        print(row)
