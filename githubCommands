@@ -1,0 +1,49 @@
+Cheat sheet for streamlining collaboration with Git
+You learned about Git and its importance in software development in Course 1. However, the way you use Git as an individual and as a member of a software development team are different. This quick reference guide will show you more about common Git commands and features that are used in a collaborative environment.
+
+Understanding Git Collaboration: Building a Solid Foundation
+Git introduces the concept of branches, enabling you to work on different features or bug fixes in isolation without disrupting the main codebase. Branches act as parallel universes, allowing you to experiment, explore new ideas, and implement changes without affecting the stability of the main project. This branching capability is crucial for collaborative development, allowing multiple developers to work on different aspects of the project simultaneously. You can create, switch between, and merge branches, allowing seamless integration of your work. Once a branch has served its purpose and is no longer needed, it can be deleted to maintain a clean and organized repository.
+
+Some commands in this document will be used more frequently than others. There are often developers assigned to designing and maintaining the build infrastructure, managing dependencies, automating build processes, and ensuring the quality and reliability of software releases. Engineers in this area may have titles such as build engineers or release engineers, and they are likely to use these commands daily. As a new developer, the critical concepts here are branching and merging, in addition to the init, add, commit, push, and pull commands from Course 1.
+
+Git Commands: Working with Branches
+Let's take a look into important Git commands that are commonly used when working with teams.
+
+git branch <branch_name> is used to create a new branch. This allows you to create a separate line of development, often used for new features or bug fixes. In a collaborative environment, each developer can create their own branch (or branches) to work on specific features or bug fixes independently, preventing conflicts and ensuring a smooth development process. Each of these branches can then be associated with a remote counterpart. This allows developers to safely share their code and collaborate with others. The upstream branch is the branch on the remote repository that your local branch is associated with, typically the ‘main’ or ‘master’ branch on the remote repository. It is used as a reference point for pulling and pushing changes, ensuring that your local branch stays in sync with the shared codebase. 
+
+git branch --set-upstream-to <remote>/<branch_name> can be used to set a specific branch as the upstream branch. By default, the upstream branch is set to the branch that your local branch was originally created from, typically the ‘main’ or ‘master’ branch. However, in more complex workflows involving multiple remote repositories or specialized branching strategies, you might intentionally set a different upstream branch to facilitate collaboration or isolate specific changes. Changing the upstream repository allows you to create a separate line of development, often used for new features or bug fixes. 
+
+git checkout <branch_name> allows you to switch between branches, so you can focus on specific features or bug fixes without affecting other parts of the project. You can use this function to experiment and innovate without fear of disrupting the main project. Once you are satisfied with your work on the feature branch, you can merge it back into the main branch.
+
+git merge <branch_name> integrates the changes from a specific branch into your current branch. It's like weaving together different threads of a story, creating a cohesive narrative. Merging branches is a necessary step in collaborative development, allowing you to combine the work of multiple developers into a unified codebase. However, merging can sometimes lead to conflicts if changes made in different branches affect the same lines of code. Resolving these conflicts is crucial to ensure a smooth integration of changes.
+
+git pull and git push  were introduced in a previous course. Recall that pulls are used to fetch and merge changes from the remote repository into your local branch, while pushes send your local commits to the remote repository. The default remote branch is named origin, but you can work with multiple remote repositories.
+
+git pull -u <remote> <branch_name> allows you to fetch and merge changes from a remote repository into your local branch, while simultaneously setting the upstream branch for future pulls and pushes. This streamlines your workflow by establishing a link between your local and remote branches, eliminating the need to specify branch names repeatedly.
+
+git push -u <remote> <branch_name> allows you to send your local commits to a remote repository (specified by `<remote>) and create a new branch there with the same name (specified by `<branch_name>`), while simultaneously setting the upstream branch for future pushes and pulls. This streamlines your workflow by establishing a link between your local branch and its corresponding remote branch, eliminating the need to specify branch names repeatedly, and pushing your changes to a shared environment for collaboration.
+
+git reset  is often used to undo local commits or changes that haven’t been pushed to a remote repository. This command is useful for undoing local changes, and is quicker than deleting a folder and re-running the git init command to create a repository.
+
+git stash  temporarily saves changes that you've made but aren't ready to commit yet. It's like putting your work-in-progress on a shelf, allowing you to switch branches or pull changes without losing your uncommitted modifications.
+
+Git Commands: Informational
+Beyond branching and merging, Git offers a range of informational commands that provide valuable insights into your project's history, current state, and the changes you've made. These commands act as your project's detective, allowing you to track modifications, compare versions, and understand the evolution of your codebase.
+
+git status provides a snapshot of the current state of your repository, showing which files have been modified, added, or deleted. It's like checking the status of your project, keeping you informed about the changes you've made and those that are pending.
+
+git log displays a chronological list of all commits in your repository, along with their associated messages and authors. It's like browsing through a project diary, allowing you to trace the history of changes and understand the evolution of the codebase.
+
+git diff shows the differences between two commits, branches, or files. It's like comparing two versions of a document, highlighting the changes that have been made. This is valuable for understanding the impact of your modifications and identifying potential conflicts before merging branches.
+
+A Note on Merge Conflicts
+Merge conflicts are a common challenge in collaborative programming environments, often arising when multiple developers modify the same lines of code in their respective branches. These conflicts can be frustrating and time-consuming to resolve, as they require careful analysis and decision-making to determine the correct integration of changes. If not handled properly, merge conflicts can introduce bugs, break functionality, and disrupt the development workflow.
+
+Encountering your first merge conflict can be daunting, but rest assured, it's a hurdle every developer encounters. If you reach out to a senior colleague for help, they'll likely chuckle and share their own stories of overcoming similar challenges. Merge conflicts are a normal part of collaborative coding, and with practice, you'll master the art of resolving them effectively.
+
+Merge conflicts are less likely to occur when developers work on separate files within a project. As you learned in Course 1, deconstructing programs into multiple files is a common practice. This modular approach not only promotes code organization and reusability but also significantly reduces the chances of merge conflicts. When developers work on distinct files, their changes are isolated to specific areas of the codebase, minimizing the likelihood of overlapping modifications and the resulting conflicts. This strategy, combined with effective communication and branching strategies, contributes to a smoother and more efficient collaborative development process.
+
+Pull Requests: Collaboration and Code Review
+In collaborative Git workflows, direct merging into the main branch is generally discouraged. Instead, developers create pull requests to propose their changes. A pull request acts as a formal request to merge your branch into another, typically the main branch. This process facilitates code review, allowing other team members to examine your changes, provide feedback, and ensure code quality before integrating them into the main codebase.
+
+The exact process to create pull requests varies based on your Git hosting service, but it generally is done through the web interface of the service. You'll specify the source branch (your feature branch) and the target branch (usually the main branch), and provide a descriptive title and summary of your changes. This will notify your collaborators and initiate the code review process. This will be covered in more depth in a later lesson.
