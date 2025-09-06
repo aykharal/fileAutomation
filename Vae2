@@ -1,0 +1,125 @@
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ===================== #
+# Encoder
+# ===================== #
+class Encoder(Model):
+    def __init__(self, input_dim, hidden_dim, latent_dim):
+        super(Encoder, self).__init__()
+        self.fc1 = layers.Dense(hidden_dim, activation="relu")
+        self.fc_mu = layers.Dense(latent_dim)
+        self.fc_logvar = layers.Dense(latent_dim)
+
+    def call(self, x):
+        h = self.fc1(x)
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        return mu, logvar
+
+# ===================== #
+# Decoder
+# ===================== #
+class Decoder(Model):
+    def __init__(self, latent_dim, hidden_dim, output_dim):
+        super(Decoder, self).__init__()
+        self.fc1 = layers.Dense(hidden_dim, activation="relu")
+        self.fc2 = layers.Dense(output_dim)   # regression output (no sigmoid)
+        
+    def call(self, z):
+        h = self.fc1(z)
+        return self.fc2(h)
+
+# ===================== #
+# VAE model
+# ===================== #
+class VAE(Model):
+    def __init__(self, input_dim, hidden_dim, latent_dim):
+        super(VAE, self).__init__()
+        self.encoder = Encoder(input_dim, hidden_dim, latent_dim)
+        self.decoder = Decoder(latent_dim, hidden_dim, input_dim)
+
+    def reparameterize(self, mu, logvar):
+        eps = tf.random.normal(shape=tf.shape(mu))
+        return mu + tf.exp(0.5 * logvar) * eps
+
+    def call(self, x):
+        mu, logvar = self.encoder(x)
+        z = self.reparameterize(mu, logvar)
+        x_hat = self.decoder(z)
+        return x_hat, mu, logvar
+
+# ===================== #
+# Loss function
+# ===================== #
+def vae_loss(x, x_hat, mu, logvar):
+    # Mean squared error for reconstruction since data is continuous
+    recon_loss = tf.reduce_sum(tf.square(x - x_hat), axis=1)
+    kl_loss = -0.5 * tf.reduce_sum(1 + logvar - tf.square(mu) - tf.exp(logvar), axis=1)
+    return tf.reduce_mean(recon_loss + kl_loss)
+
+# ===================== #
+# Example Training
+# ===================== #
+# Hyperparameters
+input_dim = 2       # (voltage, capacity)
+hidden_dim = 32
+latent_dim = 2
+batch_size = 64
+epochs = 50
+lr = 1e-3
+
+# Example synthetic dataset (replace this with your real Mx2 data)
+M = 7000
+voltage = np.random.uniform(3.0, 4.2, size=(M, 1))
+capacity = np.random.uniform(0.0, 1.0, size=(M, 1))
+x_train = np.hstack([voltage, capacity]).astype("float32")
+
+train_dataset = tf.data.Dataset.from_tensor_slices(x_train).shuffle(1000).batch(batch_size)
+
+# Model and optimizer
+vae = VAE(input_dim, hidden_dim, latent_dim)
+optimizer = tf.keras.optimizers.Adam(lr)
+
+# Training loop
+for epoch in range(epochs):
+    train_loss = 0
+    for step, x in enumerate(train_dataset):
+        with tf.GradientTape() as tape:
+            x_hat, mu, logvar = vae(x)
+            loss = vae_loss(x, x_hat, mu, logvar)
+        grads = tape.gradient(loss, vae.trainable_variables)
+        optimizer.apply_gradients(zip(grads, vae.trainable_variables))
+        train_loss += loss.numpy()
+    
+    print(f"Epoch {epoch+1}, Loss: {train_loss / (step+1):.4f}")
+
+# ===================== #
+# Visualize latent space
+# ===================== #
+mu, logvar = vae.encoder(x_train)
+z = vae.reparameterize(mu, logvar).numpy()
+
+plt.figure(figsize=(6,6))
+plt.scatter(z[:,0], z[:,1], alpha=0.5, s=5)
+plt.xlabel("Latent dim 1")
+plt.ylabel("Latent dim 2")
+plt.title("Latent space of voltage-capacity data")
+plt.show()
+
+# ===================== #
+# Generate new samples
+# ===================== #
+z_samples = tf.random.normal(shape=(100, latent_dim))
+generated = vae.decoder(z_samples).numpy()
+
+plt.figure(figsize=(6,6))
+plt.scatter(x_train[:,0], x_train[:,1], alpha=0.3, label="Original data")
+plt.scatter(generated[:,0], generated[:,1], alpha=0.8, label="Generated samples")
+plt.xlabel("Voltage")
+plt.ylabel("Capacity")
+plt.legend()
+plt.title("Generated vs Original Data")
+plt.show()
