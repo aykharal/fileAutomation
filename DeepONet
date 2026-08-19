@@ -1,0 +1,409 @@
+"""
+Physics-Informed DeepONet (PI-DeepONet) for Li-ion Battery SOC Estimation
+==========================================================================
+
+Implements the Single Particle Model (SPM) solid-phase diffusion equations
+(spherical Fickian diffusion) in dimensionless form and trains a DeepONet to
+learn the OPERATOR mapping:
+
+        current profile I(t)   ---->   concentration field C(x, tau)
+
+so that, once trained, it can be evaluated instantly (no PDE solve) for any
+new current/drive profile to estimate State of Charge (SOC) over time.
+
+Governing equations implemented (as given / numbered in the reference text):
+
+    Eq.(9)  dC/dtau = (1/x^2) d/dx( x^2 dC/dx )                      [PDE]
+    Eq.(10) dC/dx = 0                 at x = 0, tau >= 0             [BC1, symmetry]
+    Eq.(11) dC/dx = -delta            at x = 1, tau >= 0             [BC2, flux]
+    Eq.(12) delta = +/- I(t) R_j / (A L_j F D_s,j a_j c0)            [applied flux]
+    Eq.(13) C = 1                     at tau = 0, 0<=x<=1            [IC]
+    Eq.(14) SOC = (c_s,j - c_min) / (c_max - c_min)                  [SOC definition]
+
+    with C = c_s,j/c0 , x = r/R_j , tau = D_s,j * t / R_j^2          (Eq. 8)
+
+The branch net encodes the input current function I(t) (sampled at fixed
+"sensor" time points). The trunk net encodes the query point (x, tau).
+Their outputs are combined via a dot product (standard DeepONet, Lu et al.
+2021). The network is trained WITHOUT any labeled PDE solution data -- only
+by minimizing the PDE residual + boundary/initial condition residuals
+(computed via automatic differentiation), across a distribution of randomly
+generated current profiles. This is what makes it "physics-informed" and an
+"operator" network (it generalizes across the *function space* of current
+profiles, not just a single fixed I(t)).
+
+A random current-profile generator is used for training/demo. Swap in your
+own drive-cycle profiles at inference time -- see `predict_soc()` and the
+`__main__` section at the bottom for exactly where to plug them in.
+
+A simple finite-difference (semi-analytical, via the u = x*C substitution
+which turns the spherical PDE into a plain 1D heat equation) reference
+solver is included to sanity-check the trained network.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+torch.manual_seed(0)
+np.random.seed(0)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ---------------------------------------------------------------------------
+# 1. Battery / particle parameters (edit these for your own cell / electrode)
+# ---------------------------------------------------------------------------
+class BatteryParams:
+    def __init__(self):
+        self.Ds     = 3.9e-14     # solid-phase diffusion coefficient D_s,j [m^2/s]
+        self.Rj     = 1.0e-5      # particle radius R_j [m]
+        self.A      = 1.0         # electrode sheet area [m^2]
+        self.Lj     = 1.0e-4      # electrode thickness [m]
+        self.F      = 96485.0     # Faraday constant [C/mol]
+        self.eps_j  = 0.6         # solid active-material volume fraction
+        self.c0     = 25000.0     # initial solid concentration (fully charged state), Eq.(7) [mol/m^3]
+        self.c_max  = 31370.0     # max solid-phase concentration [mol/m^3]
+        self.c_min  = 100.0       # min solid-phase concentration [mol/m^3]
+        self.sign   = -1.0        # sign convention in Eq.(11)/(12): +1 or -1 depending on
+                                   # electrode (p/n) and charge/discharge current convention
+
+    @property
+    def aj(self):
+        # a_j = 3*eps_j / R_j  (specific interfacial area, defined under Eq. 6)
+        return 3.0 * self.eps_j / self.Rj
+
+    @property
+    def tau_per_second(self):
+        # tau = Ds * t / Rj^2  ->  scale factor to convert real seconds to tau
+        return self.Ds / self.Rj ** 2
+
+
+params = BatteryParams()
+
+
+def current_to_delta(I, p: BatteryParams):
+    """Eq. (12): delta = sign * I(t) * Rj / (A * Lj * F * Ds * aj * c0)"""
+    denom = p.A * p.Lj * p.F * p.Ds * p.aj * p.c0
+    return p.sign * I * p.Rj / denom
+
+
+# ---------------------------------------------------------------------------
+# 2. Random current-profile generator (REPLACE with real drive profiles later)
+# ---------------------------------------------------------------------------
+# A profile is parameterized as a short random Fourier series. This lets us
+# evaluate I(t) at ANY continuous time (needed at arbitrary collocation
+# points for the physics loss), not just at the fixed sensor grid.
+#
+# ---> TO USE YOUR OWN DRIVE PROFILE AT INFERENCE TIME <---
+# You don't need this random generator at all -- just resample your measured
+# current-vs-time array onto `T_TOTAL` seconds / `M_SENSORS` points (e.g. via
+# np.interp) and feed that array directly to `predict_soc()`. See bottom.
+
+K_MODES = 6            # number of sinusoids per random profile
+T_TOTAL = 3600.0        # training horizon [s]  (e.g. a 1-hour drive/cycle)
+M_SENSORS = 50          # number of sensor points describing I(t) to the branch net
+I_MAX = 50.0            # rough current amplitude scale [A]
+
+
+def sample_current_coeffs(batch_size, device=device):
+    A = (torch.rand(batch_size, K_MODES, device=device) * 2 - 1) * (I_MAX / K_MODES)
+    freq = torch.rand(batch_size, K_MODES, device=device) * (8.0 / T_TOTAL) + (0.5 / T_TOTAL)
+    phase = torch.rand(batch_size, K_MODES, device=device) * 2 * np.pi
+    offset = (torch.rand(batch_size, 1, device=device) * 2 - 1) * 0.1 * I_MAX
+    return dict(A=A, freq=freq, phase=phase, offset=offset)
+
+
+def eval_current(coeffs, t):
+    """
+    Evaluate I(t) for a batch of random profiles.
+    t: shape (N,)  -> same time points for every profile in the batch, returns (B, N)
+    t: shape (B,N) -> different time points per profile, returns (B, N)
+    """
+    A, freq, phase, offset = coeffs["A"], coeffs["freq"], coeffs["phase"], coeffs["offset"]
+    if t.dim() == 1:
+        tt = t.view(1, -1, 1)          # (1, N, 1) broadcasts over batch
+    else:
+        tt = t.unsqueeze(-1)           # (B, N, 1)
+    A_, freq_, phase_ = A.unsqueeze(1), freq.unsqueeze(1), phase.unsqueeze(1)
+    I = (A_ * torch.sin(2 * np.pi * freq_ * tt + phase_)).sum(dim=-1) + offset
+    return I  # (B, N)
+
+
+# ---------------------------------------------------------------------------
+# 3. PI-DeepONet architecture
+# ---------------------------------------------------------------------------
+class MLP(nn.Module):
+    def __init__(self, in_dim, hidden, out_dim, activate_last=False):
+        super().__init__()
+        dims = [in_dim] + hidden + [out_dim]
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2 or activate_last:
+                layers.append(nn.Tanh())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class PIDeepONet(nn.Module):
+    """
+    branch(I_sensor) -> (.., p)
+    trunk(x, tau)     -> (.., p)
+    output = sum_k branch_k * trunk_k + bias   (standard "unstacked" DeepONet)
+    """
+    def __init__(self, m_sensors, p=100, hidden=(128, 128, 128)):
+        super().__init__()
+        self.branch = MLP(m_sensors, list(hidden), p, activate_last=False)
+        self.trunk = MLP(2, list(hidden), p, activate_last=True)
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, I_sensor, x, tau):
+        """
+        I_sensor: (L, m_sensors)
+        x, tau  : (L,)
+        returns C: (L,)
+        """
+        trunk_in = torch.stack([x, tau], dim=-1)     # (L, 2)
+        b_out = self.branch(I_sensor)                # (L, p)
+        t_out = self.trunk(trunk_in)                  # (L, p)
+        C = (b_out * t_out).sum(dim=-1) + self.bias
+        return C
+
+
+# ---------------------------------------------------------------------------
+# 4. Physics-informed loss
+# ---------------------------------------------------------------------------
+def physics_loss(model, params, batch_size, N_pde=128, N_bc=64, N_ic=64,
+                  T_total=T_TOTAL, m_sensors=M_SENSORS, device=device):
+
+    tau_max = T_total * params.tau_per_second
+
+    # --- sample a batch of random current profiles (this is the "operator" part) ---
+    coeffs = sample_current_coeffs(batch_size, device=device)
+    t_sensors = torch.linspace(0.0, T_total, m_sensors, device=device)
+    I_sensor = eval_current(coeffs, t_sensors)          # (B, m_sensors)
+
+    def repeat_branch(I_sensor, n_pts):
+        # (B, m) -> (B*n_pts, m), each profile's sensor row repeated n_pts times
+        return I_sensor.unsqueeze(1).expand(-1, n_pts, -1).reshape(-1, I_sensor.shape[-1])
+
+    # ---------------- PDE residual (interior collocation points) ----------------
+    x_pde = (1e-2 + 0.99 * torch.rand(batch_size, N_pde, device=device)).requires_grad_(True)
+    tau_pde = (torch.rand(batch_size, N_pde, device=device) * tau_max).requires_grad_(True)
+    x_pde_f, tau_pde_f = x_pde.reshape(-1), tau_pde.reshape(-1)
+    I_pde = repeat_branch(I_sensor, N_pde)
+
+    C_pde = model(I_pde, x_pde_f, tau_pde_f)
+    dC_dx = torch.autograd.grad(C_pde.sum(), x_pde_f, create_graph=True)[0]
+    d2C_dx2 = torch.autograd.grad(dC_dx.sum(), x_pde_f, create_graph=True)[0]
+    dC_dtau = torch.autograd.grad(C_pde.sum(), tau_pde_f, create_graph=True)[0]
+
+    # Eq.(9): dC/dtau = (1/x^2) d/dx(x^2 dC/dx) = d2C/dx2 + (2/x) dC/dx
+    residual_pde = dC_dtau - (d2C_dx2 + (2.0 / x_pde_f) * dC_dx)
+    L_pde = (residual_pde ** 2).mean()
+
+    # ---------------- BC1, Eq.(10): dC/dx = 0 at x=0 ----------------
+    x_bc1 = torch.zeros(batch_size, N_bc, device=device, requires_grad=True)
+    tau_bc1 = (torch.rand(batch_size, N_bc, device=device) * tau_max).requires_grad_(True)
+    x_bc1_f, tau_bc1_f = x_bc1.reshape(-1), tau_bc1.reshape(-1)
+    I_bc1 = repeat_branch(I_sensor, N_bc)
+    C_bc1 = model(I_bc1, x_bc1_f, tau_bc1_f)
+    dC_dx_bc1 = torch.autograd.grad(C_bc1.sum(), x_bc1_f, create_graph=True)[0]
+    L_bc1 = (dC_dx_bc1 ** 2).mean()
+
+    # ---------------- BC2, Eq.(11): dC/dx = -delta at x=1 ----------------
+    x_bc2 = torch.ones(batch_size, N_bc, device=device, requires_grad=True)
+    tau_bc2 = (torch.rand(batch_size, N_bc, device=device) * tau_max)
+    real_t_bc2 = tau_bc2 / params.tau_per_second           # convert tau -> real seconds
+    I_bc2_vals = eval_current(coeffs, real_t_bc2)          # (B, N_bc), current at those times
+    delta_bc2 = current_to_delta(I_bc2_vals, params)       # Eq. (12)
+
+    x_bc2_f, tau_bc2_f = x_bc2.reshape(-1), tau_bc2.reshape(-1)
+    I_bc2 = repeat_branch(I_sensor, N_bc)
+    C_bc2 = model(I_bc2, x_bc2_f, tau_bc2_f)
+    dC_dx_bc2 = torch.autograd.grad(C_bc2.sum(), x_bc2_f, create_graph=True)[0]
+    residual_bc2 = dC_dx_bc2 + delta_bc2.reshape(-1)       # dC/dx - (-delta) = dC/dx + delta
+    L_bc2 = (residual_bc2 ** 2).mean()
+
+    # ---------------- IC, Eq.(13): C = 1 at tau = 0 ----------------
+    x_ic = torch.rand(batch_size, N_ic, device=device)
+    tau_ic = torch.zeros(batch_size, N_ic, device=device)
+    x_ic_f, tau_ic_f = x_ic.reshape(-1), tau_ic.reshape(-1)
+    I_ic = repeat_branch(I_sensor, N_ic)
+    C_ic = model(I_ic, x_ic_f, tau_ic_f)
+    L_ic = ((C_ic - 1.0) ** 2).mean()
+
+    total = L_pde + L_bc1 + L_bc2 + L_ic
+    return total, dict(pde=L_pde.item(), bc1=L_bc1.item(), bc2=L_bc2.item(), ic=L_ic.item())
+
+
+# ---------------------------------------------------------------------------
+# 5. Training loop
+# ---------------------------------------------------------------------------
+def train(epochs=3000, batch_size=32, lr=1e-3, log_every=200):
+    model = PIDeepONet(m_sensors=M_SENSORS).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    history = []
+    for ep in range(1, epochs + 1):
+        opt.zero_grad()
+        loss, parts = physics_loss(model, params, batch_size)
+        loss.backward()
+        opt.step()
+        sched.step()
+        history.append(loss.item())
+        if ep % log_every == 0 or ep == 1:
+            print(f"epoch {ep:5d}  loss={loss.item():.3e}  "
+                  f"pde={parts['pde']:.2e} bc1={parts['bc1']:.2e} "
+                  f"bc2={parts['bc2']:.2e} ic={parts['ic']:.2e}")
+    return model, history
+
+
+# ---------------------------------------------------------------------------
+# 6. Inference: current profile (array) -> SOC(t) using the trained operator
+# ---------------------------------------------------------------------------
+def predict_soc(model, I_profile_A, t_profile_s, params=params,
+                 T_total=T_TOTAL, m_sensors=M_SENSORS, n_time_eval=200):
+    """
+    I_profile_A : 1D array-like, current in Amps (sign convention: match Eq.12/BC)
+    t_profile_s : 1D array-like, time in seconds, same length as I_profile_A
+                  (does not need to be uniformly spaced)
+
+    Returns: t_eval (n_time_eval,), C_surface (n_time_eval,), SOC (n_time_eval,)
+    """
+    t_profile_s = np.asarray(t_profile_s, dtype=np.float64)
+    I_profile_A = np.asarray(I_profile_A, dtype=np.float64)
+
+    # Resample the (possibly arbitrary-length / arbitrary-duration) drive
+    # profile onto the fixed sensor grid the branch net was trained with.
+    # If your drive profile has a very different total duration than
+    # T_TOTAL, either (a) retrain with a matching T_TOTAL, or (b) rescale
+    # time here -- both are one-line changes.
+    t_sensors_np = np.linspace(0.0, T_total, m_sensors)
+    I_sensor_np = np.interp(t_sensors_np, t_profile_s, I_profile_A,
+                             left=I_profile_A[0], right=I_profile_A[-1])
+    I_sensor = torch.tensor(I_sensor_np, dtype=torch.float32, device=device).unsqueeze(0)  # (1,m)
+
+    t_eval = np.linspace(0.0, min(T_total, t_profile_s[-1]), n_time_eval)
+    tau_eval = torch.tensor(t_eval * params.tau_per_second, dtype=torch.float32, device=device)
+    x_surface = torch.ones_like(tau_eval)
+    I_rep = I_sensor.expand(n_time_eval, -1)
+
+    model.eval()
+    with torch.no_grad():
+        C_surface = model(I_rep, x_surface, tau_eval).cpu().numpy()
+    model.train()
+
+    c_s = C_surface * params.c0
+    soc = (c_s - params.c_min) / (params.c_max - params.c_min)   # Eq. (14)
+    return t_eval, C_surface, soc
+
+
+# ---------------------------------------------------------------------------
+# 7. Reference finite-difference solver (for validation only)
+# ---------------------------------------------------------------------------
+def fd_reference_solution(I_profile_A, t_profile_s, params=params, T_total=T_TOTAL, n_x=200):
+    """
+    Solves Eq.(9)-(13) numerically via the substitution u = x*C, which turns
+    the spherical diffusion equation into a plain 1D heat equation:
+        du/dtau = d2u/dx2 ,  u(0,tau)=0 ,  u'(1,tau) = u(1,tau) - delta(tau)
+    Used only to sanity-check the trained PI-DeepONet -- not part of the
+    operator-learning pipeline itself.
+    """
+    x = np.linspace(0.0, 1.0, n_x)
+    dx = x[1] - x[0]
+    tau_max = T_total * params.tau_per_second
+
+    def delta_of_tau(tau):
+        t = tau / params.tau_per_second
+        I = np.interp(t, t_profile_s, I_profile_A, left=I_profile_A[0], right=I_profile_A[-1])
+        return float(current_to_delta(I, params))
+
+    u0 = x.copy()   # C=1 everywhere at tau=0  ->  u = x*C = x
+
+    def rhs(tau, u):
+        u = u.copy()
+        u[0] = 0.0  # Dirichlet at x=0
+        dudt = np.zeros_like(u)
+        # interior nodes
+        dudt[1:-1] = (u[2:] - 2 * u[1:-1] + u[:-2]) / dx ** 2
+        # Robin BC at x=1 via ghost node: (u_ghost - u[-2])/(2dx) = u[-1] - delta
+        delta = delta_of_tau(tau)
+        u_ghost = u[-2] + 2 * dx * (u[-1] - delta)
+        dudt[-1] = (u_ghost - 2 * u[-1] + u[-2]) / dx ** 2
+        dudt[0] = 0.0  # held at Dirichlet value
+        return dudt
+
+    sol = solve_ivp(rhs, [0, tau_max], u0, method="RK45",
+                     t_eval=np.linspace(0, tau_max, 200), rtol=1e-7, atol=1e-9)
+    C_surface = sol.y[-1, :] / x[-1]     # C(1,tau) = u(1,tau)/1
+    t_eval = sol.t / params.tau_per_second
+    return t_eval, C_surface
+
+
+# ---------------------------------------------------------------------------
+# 8. Demo
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+
+    print(f"Device: {device}")
+    print(f"tau_max for T_total={T_TOTAL}s : {T_TOTAL * params.tau_per_second:.4f}")
+
+    model, history = train(epochs=6000, batch_size=16)
+
+    # ---- build ONE test current profile (random for now; replace with your drive data) ----
+    test_coeffs = sample_current_coeffs(1, device=device)
+    t_test = np.linspace(0, T_TOTAL, 400)
+    I_test = eval_current(test_coeffs, torch.tensor(t_test, dtype=torch.float32, device=device))
+    I_test = I_test.squeeze(0).cpu().numpy()
+
+    # ---> TO USE YOUR OWN DRIVE PROFILE, REPLACE THE 3 LINES ABOVE WITH E.G.:
+    # data = np.loadtxt("my_drive_profile.csv", delimiter=",")
+    # t_test, I_test = data[:, 0], data[:, 1]   # time [s], current [A]
+
+    t_eval, C_surface_nn, soc_nn = predict_soc(model, I_test, t_test)
+    t_fd, C_surface_fd = fd_reference_solution(I_test, t_test)
+
+    # ---- plots ----
+    fig, axes = plt.subplots(3, 1, figsize=(8, 10))
+
+    axes[0].plot(history)
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("epoch")
+    axes[0].set_ylabel("physics loss")
+    axes[0].set_title("Training loss (PDE + BC + IC residuals)")
+
+    axes[1].plot(t_test, I_test)
+    axes[1].set_xlabel("time [s]")
+    axes[1].set_ylabel("Current I(t) [A]")
+    axes[1].set_title("Test current profile (random demo profile)")
+
+    axes[2].plot(t_eval, C_surface_nn, label="PI-DeepONet")
+    axes[2].plot(t_fd, C_surface_fd, "--", label="Finite-difference reference")
+    axes[2].set_xlabel("time [s]")
+    axes[2].set_ylabel("Surface concentration C(1, tau)")
+    axes[2].set_title("Validation: DeepONet vs. numerical PDE solution")
+    axes[2].legend()
+
+    plt.tight_layout()
+    #plt.savefig("/mnt/user-data/outputs/pi_deeponet_soc_results.png", dpi=150)
+    print("Saved plot to pi_deeponet_soc_results.png")
+##
+    # ---- SOC vs time ----
+    plt.figure(figsize=(8, 4))
+    plt.plot(t_eval, soc_nn)
+    plt.xlabel("time [s]")
+    plt.ylabel("SOC")
+    plt.title("Estimated SOC(t) from PI-DeepONet (Eq. 14)")
+    plt.tight_layout()
+    #plt.savefig("/mnt/user-data/outputs/soc_vs_time.png", dpi=150)
+    print("Saved plot to soc_vs_time.png")
+
+    #torch.save(model.state_dict(), "/mnt/user-data/outputs/pi_deeponet_soc_model.pt")
+    print("Saved trained model weights to pi_deeponet_soc_model.pt")
